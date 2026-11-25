@@ -155,7 +155,7 @@ td.tn{color:var(--lime);font-weight:800}
     <form id="adminLogin" class="login" novalidate><div><label for="adminKey">Admin key</label><input id="adminKey" type="password" autocomplete="off"><div class="err" id="adminErr"></div></div><button class="btn" type="submit">Unlock</button></form>
     <div id="adminTools" hidden style="display:flex;flex-direction:column;gap:16px">
     <div class="row"><button class="btn" id="exportBtn">Export to Excel</button><button class="btn ghost" id="linkBtn">Link Excel file (auto-save)</button><span class="hint" id="exportNote"></span></div>
-    <div class="hint" id="linkNote">Tip: link an Excel file once; every new registration is then saved into it automatically (Chrome / Edge). Data is also kept in this browser.</div>
+    <div class="hint" id="linkNote">Tip: link an Excel file once; while this Admin page stays open, every new registration from anyone is saved into it automatically (Chrome / Edge).</div>
     <div class="tablewrap"><table><thead><tr><th>Team</th><th>Team name</th><th>Registered by</th><th>Registered at</th><th></th></tr></thead><tbody id="adminBody"></tbody></table></div></div>
   </section>
 </div>
@@ -225,78 +225,38 @@ const fmtDT=iso=>{try{return new Date(iso).toLocaleString('en-GB',{day:'2-digit'
 
 let isAdmin=false,adminKey='';
 let teams=[],loaded=false,session=null,selGroup=null;
-/* ---------- local backend: same rules as server.js, data kept in this browser + saved to Excel ---------- */
-const ADMIN_B64='KU9LTTlpam4=';              // admin key (client-side check)
-const LS='bst-teams-v1';
+/* ---------- shared backend (Supabase): everyone sees the same registrations ---------- */
+const SUPABASE_URL='https://kbtotbqjjnwrchurgpcg.supabase.co';
+const SUPABASE_KEY='sb_publishable_CwtHm13Hs_dJ6FkuVInsDw_yOAeE0cl';
 const ORDER=Object.keys(CONFIG.GROUPS);
-const BADGE=/^[A-Z0-9_-]{3,20}$/, DEPT=/^[A-Z0-9_-]{2,12}$/;
-const sessions=new Map(); const SESSION_MS=2*60*60*1000;
-let db=[]; function loadDb(){try{db=JSON.parse(localStorage.getItem(LS)||'[]')}catch(_){}}
-loadDb();
-window.addEventListener('storage',e=>{if(e.key===LS)loadDb()});
-const sortedDb=()=>[...db].sort((a,b)=>ORDER.indexOf(a.group)-ORDER.indexOf(b.group)||a.slot-b.slot);
-const publicInfo=()=>({teams:sortedDb(),deadline:CONFIG.DEADLINE.toISOString(),closed:closed(),total:CONFIG.TOTAL,groups:CONFIG.GROUPS});
-const findByBadge=b=>db.find(t=>t.members.some(m=>m.badge===b));
-const adminOk=k=>{try{return btoa(String(k||''))===ADMIN_B64}catch(_){return false}};
-function reply(code,obj){if(code>=400)throw Object.assign(new Error(obj.error||'Error'),{status:code,data:obj});return obj}
-function persist(){try{localStorage.setItem(LS,JSON.stringify(db))}catch(_){} xlsxSave()}
-function randToken(){const a=new Uint8Array(18);crypto.getRandomValues(a);return [...a].map(x=>x.toString(16).padStart(2,'0')).join('')}
-async function api(path,opts={}){
-  const h=opts.headers||{}, m=opts.method||'GET', body=opts.body?JSON.parse(opts.body):{};
-  if(path==='/api/teams'&&m==='GET')return publicInfo();
-  if(path==='/api/login'){
-    const b=String(body.badge||'').trim().toUpperCase();
-    if(!BADGE.test(b))return reply(400,{error:'Badge ID must be 3 to 20 letters, digits, - or _.'});
-    if(closed())return reply(403,{error:'Registration is closed.',closed:true});
-    const t=findByBadge(b);
-    if(t)return reply(409,{error:`Badge ID ${b} is already registered in team ${t.teamId} (${t.teamName}).`,team:t});
-    const token=randToken(); sessions.set(token,{badge:b,exp:Date.now()+SESSION_MS});
-    return {token,badge:b};
-  }
-  if(path==='/api/register'){
-    const d=body, s=sessions.get(d.token);
-    if(!s||s.exp<Date.now())return reply(401,{errors:['Your login expired. Log in again.'],relogin:true});
-    if(closed())return reply(403,{errors:['Registration is closed.']});
-    const errs=[], g=CONFIG.GROUPS[d.group];
-    if(!g)return reply(400,{errors:['Choose a group.']});
-    const tn=String(d.teamName||'').trim().replace(/\s+/g,' ');
-    if(tn.length<3||tn.length>30)errs.push('Team name must be 3 to 30 characters.');
-    const ms=Array.isArray(d.members)?d.members:[];
-    if(ms.length!==6)errs.push('A team needs exactly 6 members.');
-    const clean=ms.map(m=>({badge:String(m.badge||'').trim().toUpperCase(),dept:String(m.dept||'').trim().toUpperCase(),name:String(m.name||'').trim().replace(/\s+/g,' ').toUpperCase(),gender:m.gender}));
-    clean.forEach((m,i)=>{
-      if(!BADGE.test(m.badge))errs.push(`Member ${i+1}: Badge ID is required.`);
-      if(!DEPT.test(m.dept))errs.push(`Member ${i+1}: Dept code is required.`);
-      if(m.name.length<3||m.name.length>80)errs.push(`Member ${i+1}: Name as per NRIC is required.`);
-      if(m.gender!=='M'&&m.gender!=='F')errs.push(`Member ${i+1}: Select gender.`);
-    });
-    if(clean[0]&&clean[0].badge!==s.badge)errs.push('Member 1 must be the person who logged in.');
-    const seen=new Set(); clean.forEach((m,i)=>{if(seen.has(m.badge))errs.push(`Member ${i+1}: Badge ID ${m.badge} is repeated in this team.`);seen.add(m.badge)});
-    const M=clean.filter(m=>m.gender==='M').length,F=clean.filter(m=>m.gender==='F').length;
-    if(clean.every(m=>m.gender)&&(M!==3||F!==3))errs.push(`Gender check failed: this team has ${M} male and ${F} female. Each team needs exactly 3 male and 3 female members.`);
-    if(errs.length)return reply(400,{errors:errs});
-    loadDb();
-    if(db.length>=CONFIG.TOTAL)return reply(409,{errors:[`All ${CONFIG.TOTAL} team slots are taken.`],back:true});
-    const inG=db.filter(t=>t.group===d.group);
-    if(inG.length>=g.cap)return reply(409,{errors:[`${g.name} is full (${g.cap} of ${g.cap}). Pick another group.`],back:true});
-    if(db.some(t=>t.teamName.toLowerCase()===tn.toLowerCase()))return reply(409,{errors:[`Team name "${tn}" is already taken. Choose another.`]});
-    const clash=[]; for(const m of clean){const t=findByBadge(m.badge);if(t)clash.push(`${m.name} (${m.badge}) is already registered in team ${t.teamId}.`)}
-    if(clash.length)return reply(409,{errors:clash});
-    const used=new Set(inG.map(t=>t.slot)); let slot=1; while(used.has(slot))slot++;
-    const team={teamId:`${g.code}-${String(slot).padStart(2,'0')}`,group:d.group,slot,teamName:tn,registeredBy:s.badge,createdAt:new Date().toISOString(),members:clean};
-    db.push(team); persist(); sessions.delete(d.token);
-    return {team};
-  }
-  if(path==='/api/admin/check')return adminOk(h['x-admin-key'])?{ok:true}:reply(401,{error:'Wrong admin key.'});
-  if(path==='/api/admin/export'){if(!adminOk(h['x-admin-key']))return reply(401,{error:'Wrong admin key.'});return publicInfo()}
-  const del=path.match(/^\/api\/teams\/([A-Z0-9-]+)$/);
-  if(del&&m==='DELETE'){
-    if(!adminOk(h['x-admin-key']))return reply(401,{error:'Wrong admin key.'});
-    const n=db.length; db=db.filter(t=>t.teamId!==del[1]); if(db.length!==n)persist();
-    return {ok:true};
-  }
-  return reply(404,{error:'Not found'});
+let lastSig='';
+async function rpc(fn,args){
+  const h={'Content-Type':'application/json',apikey:SUPABASE_KEY};
+  if(SUPABASE_KEY.startsWith('eyJ'))h.Authorization='Bearer '+SUPABASE_KEY;
+  const r=await fetch(SUPABASE_URL+'/rest/v1/rpc/'+fn,{method:'POST',headers:h,body:JSON.stringify(args||{})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok)throw Object.assign(new Error('Server error'),{status:r.status,data:{}});
+  const st=j._status||200; delete j._status;
+  if(st>=400)throw Object.assign(new Error(j.error||'Error'),{status:st,data:j});
+  return j;
 }
+let lastInfo=null;
+async function api(path,opts={}){
+  const h=opts.headers||{}, b=opts.body?JSON.parse(opts.body):{}, m=opts.method||'GET';
+  if(path==='/api/teams'&&m==='GET'){
+    const j=await rpc('api_teams'); lastInfo=j;
+    const sig=JSON.stringify(j.teams); if(sig!==lastSig){const first=!lastSig;lastSig=sig;if(!first||fileHandle)xlsxSave()}
+    return j;
+  }
+  if(path==='/api/login')return rpc('api_login',{badge:b.badge});
+  if(path==='/api/register')return rpc('api_register',{d:b});
+  if(path==='/api/admin/check')return rpc('api_admin_check',{key:h['x-admin-key']});
+  if(path==='/api/admin/export')return rpc('api_admin_export',{key:h['x-admin-key']});
+  const del=path.match(/^\/api\/teams\/([A-Z0-9-]+)$/);
+  if(del&&m==='DELETE')return rpc('api_admin_delete',{key:h['x-admin-key'],tid:del[1]});
+  throw Object.assign(new Error('Not found'),{status:404,data:{}});
+}
+const publicInfo=()=>lastInfo||{teams:[],total:CONFIG.TOTAL,groups:CONFIG.GROUPS};
 
 /* ---------- Excel (same sheets as the server version) ---------- */
 async function buildXlsx(info){
@@ -343,7 +303,7 @@ async function refresh(){
   try{const j=await api('/api/teams');teams=j.teams;loaded=true;$('#dbwarn').hidden=true;
     if(!$('#s-group').hidden)renderGroups(); if(!$('#s-form').hidden)updateSlotInfo();
     if(!$('#v-roster').hidden)renderRoster(); if(!$('#v-admin').hidden&&isAdmin)renderAdmin();
-  }catch(e){const w=$('#dbwarn');w.textContent='Cannot read the saved registrations. Refresh the page.';w.hidden=false}
+  }catch(e){const w=$('#dbwarn');w.textContent='Cannot reach the registration server. Check your network and refresh the page.';w.hidden=false}
 }
 const closed=()=>new Date()>CONFIG.DEADLINE;
 
@@ -591,15 +551,8 @@ $('#exportBtn').onclick=async()=>{
 $('#linkBtn').onclick=async()=>{
   const note=$('#exportNote');
   try{
-    const useExisting=confirm('Link an Excel file for auto-save.\n\nOK = open an EXISTING registrations file (continue from it)\nCancel = create a NEW file');
-    const types=[{description:'Excel workbook',accept:{'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':['.xlsx']}}];
-    if(useExisting){
-      const [h]=await showOpenFilePicker({types}); await h.requestPermission({mode:'readwrite'});
-      const loaded2=await readXlsx(await h.getFile());
-      if(loaded2.length&&(!db.length||confirm('Replace the '+db.length+' team(s) in this browser with the '+loaded2.length+' team(s) from the Excel file?'))){db=loaded2;try{localStorage.setItem(LS,JSON.stringify(db))}catch(_){}}
-      fileHandle=h;
-    }else{fileHandle=await showSaveFilePicker({suggestedName:'registrations.xlsx',types})}
-    await xlsxSave(); await refresh();
+    fileHandle=await showSaveFilePicker({suggestedName:'registrations.xlsx',types:[{description:'Excel workbook',accept:{'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':['.xlsx']}}]});
+    await refresh(); await xlsxSave();
   }catch(e){if(e&&e.name!=='AbortError')note.textContent='Could not link the file.'}
 };
 if(!window.showSaveFilePicker){$('#linkBtn').hidden=true;$('#linkNote').textContent='Auto-save to Excel needs Chrome or Edge. Use "Export to Excel" to download the file.'}
